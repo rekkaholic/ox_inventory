@@ -6,25 +6,11 @@ local Shops = {}
 local locations = shared.target and 'targets' or 'locations'
 
 ---@class OxShopItem
----@field name string
 ---@field slot number
 ---@field weight number
----@field price number
----@field metadata? { [string]: any }
----@field license? string
----@field currency? string
----@field grade? number | number[]
----@field count? number
-
----@class OxShopServer : OxShop
----@field id string
----@field coords vector3
----@field items OxShopItem[]
----@field slots number
----@field [string] any
 
 local function setupShopItems(id, shopType, shopName, groups)
-	local shop = id and Shops[shopType][id] or Shops[shopType] --[[@as OxShopServer]]
+	local shop = id and Shops[shopType][id] or Shops[shopType] --[[@as OxShop]]
 
 	for i = 1, shop.slots do
 		local slot = shop.items[i]
@@ -60,7 +46,7 @@ local function setupShopItems(id, shopType, shopName, groups)
 end
 
 ---@param shopType string
----@param properties OxShopServer
+---@param properties OxShop
 local function registerShopType(shopType, properties)
 	local shopLocations = properties[locations] or properties.locations
 
@@ -87,12 +73,25 @@ local function createShop(shopType, id)
 
 	if not shop then return end
 
-	local shopLocations = shop[locations] or shop.locations
+	local store = (shop[locations] or shop.locations)?[id]
+
+	if not store then return end
+
 	local groups = shop.groups or shop.jobs
+    local coords
 
-	if not shopLocations or not shopLocations[id] then return end
+    if shared.target then
+        if store.length then
+            local z = store.loc.z + math.abs(store.minZ - store.maxZ) / 2
+            coords = vec3(store.loc.x, store.loc.y, z)
+        else
+            coords = store.coords or store.loc
+        end
+    else
+        coords = store
+    end
 
-	---@type OxShopServer
+	---@type OxShop
 	shop[id] = {
 		label = shop.name,
 		id = shopType..' '..id,
@@ -100,7 +99,7 @@ local function createShop(shopType, id)
 		items = table.clone(shop.inventory),
 		slots = #shop.inventory,
 		type = 'shop',
-		coords = shared.target and shop.targets?[id]?.loc or shopLocations[id],
+		coords = coords,
 		distance = shared.target and shop.targets?[id]?.distance,
 	}
 
@@ -114,13 +113,15 @@ for shopType, shopDetails in pairs(data('shops')) do
 end
 
 ---@param shopType string
----@param shopDetails OxShopServer
+---@param shopDetails OxShop
 exports('RegisterShop', function(shopType, shopDetails)
 	registerShopType(shopType, shopDetails)
 end)
 
 lib.callback.register('ox_inventory:openShop', function(source, data)
 	local left, shop = Inventory(source)
+
+	if not left then return end
 
 	if data then
 		shop = Shops[data.type]
@@ -133,7 +134,7 @@ lib.callback.register('ox_inventory:openShop', function(source, data)
 			if not shop then return end
 		end
 
-		---@cast shop OxShopServer
+		---@cast shop OxShop
 
 		if shop.groups then
 			local group = server.hasGroup(left, shop.groups)
@@ -144,27 +145,20 @@ lib.callback.register('ox_inventory:openShop', function(source, data)
 			return
 		end
 
-		left.open = shop.id
+		---@diagnostic disable-next-line: assign-type-mismatch
+		left:openInventory(left)
+		left.currentShop = shop.id
 	end
 
-	return {label=left.label, type=left.type, slots=left.slots, weight=left.weight, maxWeight=left.maxWeight}, shop
+	return { label = left.label, type = left.type, slots = left.slots, weight = left.weight, maxWeight = left.maxWeight }, shop
 end)
-
-local table = lib.table
-
--- http://lua-users.org/wiki/FormattingNumbers
--- credit http://richard.warburton.it
-local function comma_value(n)
-	local left, num, right = string.match(n,'^([^%d]*%d)(%d*)(.-)$')
-	return left..(num:reverse():gsub('(%d%d%d)','%1,'):reverse())..right
-end
 
 local function canAffordItem(inv, currency, price)
 	local canAfford = price >= 0 and Inventory.GetItem(inv, currency, false, true) >= price
 
 	return canAfford or {
 		type = 'error',
-		description = locale('cannot_afford', ('%s%s'):format((currency == 'money' and locale('$') or comma_value(price)), (currency == 'money' and comma_value(price) or ' '..Items(currency).label)))
+		description = locale('cannot_afford', ('%s%s'):format((currency == 'money' and locale('$') or math.groupdigits(price)), (currency == 'money' and math.groupdigits(price) or ' '..Items(currency).label)))
 	}
 end
 
@@ -190,10 +184,14 @@ end
 lib.callback.register('ox_inventory:buyItem', function(source, data)
 	if data.toType == 'player' then
 		if data.count == nil then data.count = 1 end
-		local playerInv = Inventory(source)
-		local shopType, shopId = playerInv.open:match('^(.-) (%d-)$')
 
-		if not shopType then shopType = playerInv.open end
+		local playerInv = Inventory(source)
+
+		if not playerInv or not playerInv.currentShop then return end
+
+		local shopType, shopId = playerInv.currentShop:match('^(.-) (%d-)$')
+
+		if not shopType then shopType = playerInv.currentShop end
 
 		if shopId then shopId = tonumber(shopId) end
 
@@ -209,9 +207,11 @@ lib.callback.register('ox_inventory:buyItem', function(source, data)
 					data.count = fromData.count
 				end
 			end
+
 			if fromData.license and server.hasLicense and not server.hasLicense(playerInv, fromData.license) then
 				return false, false, { type = 'error', description = locale('item_unlicensed') }
 			end
+
 			if fromData.grade then
 				local _, rank = server.hasGroup(playerInv, shop.groups)
 				if not isRequiredGrade(fromData.grade, rank) then
@@ -226,10 +226,11 @@ lib.callback.register('ox_inventory:buyItem', function(source, data)
 			if result == false then return false end
 
 			local toItem = toData and Items(toData.name)
+
 			local metadata, count = Items.Metadata(playerInv, fromItem, fromData.metadata and table.clone(fromData.metadata) or {}, data.count)
 			local price = count * fromData.price
 
-			if toData == nil or (fromItem.name == toItem.name and fromItem.stack and table.matches(toData.metadata, metadata)) then
+			if toData == nil or (fromItem.name == toItem?.name and fromItem.stack and table.matches(toData.metadata, metadata)) then
 				local newWeight = playerInv.weight + (fromItem.weight + (metadata?.weight or 0)) * count
 
 				if newWeight > playerInv.maxWeight then
@@ -266,7 +267,7 @@ lib.callback.register('ox_inventory:buyItem', function(source, data)
 
 				if server.syncInventory then server.syncInventory(playerInv) end
 
-				local message = locale('purchased_for', count, fromItem.label, (currency == 'money' and locale('$') or comma_value(price)), (currency == 'money' and comma_value(price) or ' '..Items(currency).label))
+				local message = locale('purchased_for', count, fromItem.label, (currency == 'money' and locale('$') or math.groupdigits(price)), (currency == 'money' and math.groupdigits(price) or ' '..Items(currency).label))
 
 				if server.loglevel > 0 then
 					if server.loglevel > 1 or fromData.price >= 500 then

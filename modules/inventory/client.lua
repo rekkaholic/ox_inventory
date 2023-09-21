@@ -18,19 +18,89 @@ function Inventory.OpenDumpster(entity)
 	end
 end
 
+local Utils = require 'modules.utils.client'
+local Vehicles = data 'vehicles'
+local backDoorIds = { 2, 3 }
+
+function Inventory.CanAccessTrunk(entity)
+    if cache.vehicle or not NetworkGetEntityIsNetworked(entity) then return end
+
+	local vehicleHash = GetEntityModel(entity)
+    local vehicleClass = GetVehicleClass(entity)
+    local checkVehicle = Vehicles.Storage[vehicleHash]
+
+    if (checkVehicle == 0 or checkVehicle == 1) or (not Vehicles.trunk[vehicleClass] and not Vehicles.trunk.models[vehicleHash]) then return end
+
+    ---@type number | number[]
+    local doorId = checkVehicle and 4 or 5
+
+    if not Vehicles.trunk.boneIndex?[vehicleHash] and not GetIsDoorValid(entity, doorId --[[@as number]]) then
+        if vehicleClass ~= 11 and (doorId ~= 5 or GetEntityBoneIndexByName(entity, 'boot') ~= -1 or not GetIsDoorValid(entity, 2)) then
+            return
+        end
+
+        if vehicleClass ~= 11 then
+            doorId = backDoorIds
+        end
+    end
+
+    local min, max = GetModelDimensions(vehicleHash)
+    local offset = (max - min) * (not checkVehicle and vec3(0.5, 0, 0.5) or vec3(0.5, 1, 0.5)) + min
+    offset = GetOffsetFromEntityInWorldCoords(entity, offset.x, offset.y, offset.z)
+
+    if #(GetEntityCoords(cache.ped) - offset) < 1.5 then
+        local coords = GetEntityCoords(entity)
+
+        TaskTurnPedToFaceCoord(cache.ped, coords.x, coords.y, coords.z, 0)
+
+        return doorId
+    end
+end
+
+function Inventory.OpenTrunk(entity)
+    ---@type number | number[] | nil
+    local door = Inventory.CanAccessTrunk(entity)
+
+    if not door then return end
+
+    if GetVehicleDoorLockStatus(entity) > 1 then
+        return lib.notify({ id = 'vehicle_locked', type = 'error', description = locale('vehicle_locked') })
+    end
+
+    local plate = GetVehicleNumberPlateText(entity)
+    local invId = 'trunk'..plate
+    local coords = GetEntityCoords(entity)
+
+    TaskTurnPedToFaceCoord(cache.ped, coords.x, coords.y, coords.z, 0)
+
+    if not client.openInventory('trunk', { id = invId, netid = NetworkGetNetworkIdFromEntity(entity), entityid = entity, door = door }) then return end
+
+    if type(door) == 'table' then
+        for i = 1, #door do
+            SetVehicleDoorOpen(entity, door[i], false, false)
+        end
+    else
+        SetVehicleDoorOpen(entity, door --[[@as number]], false, false)
+    end
+end
+
 if shared.target then
-	exports.qtarget:AddTargetModel(Inventory.Dumpsters, {
-		options = {
-			{
-				icon = 'fas fa-dumpster',
-				label = locale('search_dumpster'),
-				action = function(entity)
-					Inventory.OpenDumpster(entity)
-				end
-			},
-		},
-		distance = 2
+	exports.ox_target:addModel(Inventory.Dumpsters, {
+        icon = 'fas fa-dumpster',
+        label = locale('search_dumpster'),
+        onSelect = function(data) return Inventory.OpenDumpster(data.entity) end,
+        distance = 2
 	})
+
+    exports.ox_target:addGlobalVehicle({
+        icon = 'fas fa-truck-ramp-box',
+        label = locale('open_label', locale('storage')),
+        distance = 1.5,
+        canInteract = Inventory.CanAccessTrunk,
+        onSelect = function(data)
+            return Inventory.OpenTrunk(data.entity)
+        end
+    })
 else
 	local dumpsters = table.create(0, #Inventory.Dumpsters)
 
@@ -40,8 +110,6 @@ else
 
 	Inventory.Dumpsters = dumpsters
 end
-
-local table = lib.table
 
 ---@param search 'slots' | 1 | 'count' | 2
 ---@param item table | string
@@ -85,6 +153,136 @@ function Inventory.Search(search, item, metadata)
 end
 exports('Search', Inventory.Search)
 
+exports('GetPlayerItems', function()
+	return PlayerData.inventory
+end)
+
+exports('GetPlayerWeight', function()
+	return PlayerData.weight
+end)
+
+exports('GetPlayerMaxWeight', function()
+	return PlayerData.maxWeight
+end)
+
+local Items = require 'modules.items.client'
+
+local function assertMetadata(metadata)
+	if metadata and type(metadata) ~= 'table' then
+		metadata = metadata and { type = metadata or nil }
+	end
+
+	return metadata
+end
+
+---@param itemName string
+---@param metadata? any
+---@param strict? boolean Strictly match metadata properties, otherwise use partial matching.
+---@return SlotWithItem?
+function Inventory.GetSlotWithItem(itemName, metadata, strict)
+	local inventory = PlayerData.inventory
+	local item = Items(itemName) --[[@as OxClientItem?]]
+
+	if not inventory or not item then return end
+
+	metadata = assertMetadata(metadata)
+	local tablematch = strict and table.matches or table.contains
+
+	for _, slotData in pairs(inventory) do
+		if slotData and slotData.name == item.name and (not metadata or tablematch(slotData.metadata, metadata)) then
+			return slotData
+		end
+	end
+end
+
+exports('GetSlotWithItem', Inventory.GetSlotWithItem)
+
+---@param itemName string
+---@param metadata? any
+---@param strict? boolean Strictly match metadata properties, otherwise use partial matching.
+---@return number?
+function Inventory.GetSlotIdWithItem(itemName, metadata, strict)
+	return Inventory.GetSlotWithItem(itemName, metadata, strict)?.slot
+end
+
+exports('GetSlotIdWithItem', Inventory.GetSlotIdWithItem)
+
+---@param itemName string
+---@param metadata? any
+---@param strict? boolean Strictly match metadata properties, otherwise use partial matching.
+---@return SlotWithItem[]?
+function Inventory.GetSlotsWithItem(itemName, metadata, strict)
+	local inventory = PlayerData.inventory
+	local item = Items(itemName) --[[@as OxClientItem?]]
+
+	if not inventory or not item then return end
+
+
+	metadata = assertMetadata(metadata)
+	local response = {}
+	local n = 0
+	local tablematch = strict and table.matches or table.contains
+
+	for _, slotData in pairs(inventory) do
+		if slotData and slotData.name == item.name and (not metadata or tablematch(slotData.metadata, metadata)) then
+			n += 1
+			response[n] = slotData
+		end
+	end
+
+	return response
+end
+
+exports('GetSlotsWithItem', Inventory.GetSlotsWithItem)
+
+---@param itemName string
+---@param metadata? any
+---@param strict? boolean Strictly match metadata properties, otherwise use partial matching.
+---@return number[]?
+function Inventory.GetSlotIdsWithItem(itemName, metadata, strict)
+	local items = Inventory.GetSlotsWithItem(itemName, metadata, strict)
+
+	if items then
+		---@cast items +number[]
+		for i = 1, #items do
+			items[i] = items[i].slot
+		end
+
+		return items
+	end
+end
+
+---@param itemName string
+---@param metadata? any
+---@param strict? boolean Strictly match metadata properties, otherwise use partial matching.
+---@return number
+function Inventory.GetItemCount(itemName, metadata, strict)
+	local inventory = PlayerData.inventory
+	local item = Items(itemName) --[[@as OxClientItem?]]
+
+	if not inventory or not item then return 0 end
+
+	if not metadata then
+		return item.count
+	end
+
+
+	metadata = assertMetadata(metadata)
+	local count = 0
+	local tablematch = strict and table.matches or table.contains
+
+	for _, slotData in pairs(inventory) do
+		if slotData and slotData.name == item.name and (not metadata or tablematch(slotData.metadata, metadata)) then
+			count += slotData.count
+		end
+	end
+
+	return count
+end
+
+exports('GetItemCount', Inventory.GetItemCount)
+
+
 local function openEvidence()
 	client.openInventory('policeevidence')
 end
@@ -104,32 +302,23 @@ Inventory.Evidence = setmetatable(data('evidence'), {
 		for _, evidence in pairs(self) do
 			if evidence.point then
 				evidence.point:remove()
-			end
+            elseif evidence.zoneId then
+                exports.ox_target:removeZone(evidence.zoneId)
+                evidence.zone = nil
+            end
 
 			if client.hasGroup(shared.police) then
 				if shared.target then
 					if evidence.target then
-						exports.qtarget:RemoveZone(evidence.target.name)
-						exports.qtarget:AddBoxZone(evidence.target.name, evidence.target.loc, evidence.target.length or 0.5, evidence.target.width or 0.5,
-						{
-							name = evidence.target.name,
-							heading = evidence.target.heading or 0.0,
-							debugPoly = evidence.target.debug,
-							minZ = evidence.target.minZ,
-							maxZ = evidence.target.maxZ,
-							drawSprite = evidence.target.drawSprite,
-						}, {
-							options = {
-								{
-									icon = evidence.target.icon or 'fas fa-warehouse',
-									label = locale('open_police_evidence'),
-									job = shared.police,
-									action = openEvidence,
-									iconColor = evidence.target.iconColor,
-								},
-							},
-							distance = evidence.target.distance or 2.0
-						})
+                        evidence.zoneId = Utils.CreateBoxZone(evidence.target, {
+                            {
+                                icon = evidence.target.icon or 'fas fa-warehouse',
+                                label = locale('open_police_evidence'),
+                                groups = shared.police,
+                                onSelect = openEvidence,
+                                iconColor = evidence.target.iconColor,
+                            }
+                        })
 					end
 				else
 					evidence.target = nil
@@ -157,34 +346,25 @@ Inventory.Stashes = setmetatable(data('stashes'), {
 
 			if stash.point then
 				stash.point:remove()
-			end
+            elseif stash.zoneId then
+                exports.ox_target:removeZone(stash.zoneId)
+                stash.zoneId = nil
+            end
 
 			if not stash.groups or client.hasGroup(stash.groups) then
 				if shared.target then
 					if stash.target then
-						exports.qtarget:RemoveZone(stash.name)
-						exports.qtarget:AddBoxZone(stash.name, stash.target.loc, stash.target.length or 0.5, stash.target.width or 0.5,
-						{
-							name = stash.name,
-							heading = stash.target.heading or 0.0,
-							debugPoly = stash.target.debug,
-							minZ = stash.target.minZ,
-							maxZ = stash.target.maxZ,
-							drawSprite = stash.target.drawSprite,
-						}, {
-							options = {
-								{
-									icon = stash.target.icon or 'fas fa-warehouse',
-									label = stash.target.label or locale('open_stash'),
-									job = stash.groups,
-									action = function()
-										exports.ox_inventory:openInventory('stash', stash.name)
-									end,
-									iconColor = stash.target.iconColor,
-								},
-							},
-							distance = stash.target.distance or 3.0
-						})
+                        stash.zoneId = Utils.CreateBoxZone(stash.target, {
+                            {
+                                icon = stash.target.icon or 'fas fa-warehouse',
+                                label = stash.target.label or locale('open_stash'),
+                                groups = stash.groups,
+                                onSelect = function()
+                                    exports.ox_inventory:openInventory('stash', stash.name)
+                                end,
+                                iconColor = stash.target.iconColor,
+                            },
+                        })
 					end
 				else
 					stash.target = nil
@@ -201,7 +381,11 @@ Inventory.Stashes = setmetatable(data('stashes'), {
 	end
 })
 
-RegisterNetEvent('refreshMaxWeight', function(data)
+RegisterNetEvent('ox_inventory:refreshMaxWeight', function(data)
+    if data.inventoryId == cache.serverId then
+        PlayerData.maxWeight = data.maxWeight
+    end
+
 	SendNUIMessage({
 		action = 'refreshSlots',
 		data = {

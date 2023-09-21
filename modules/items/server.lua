@@ -1,8 +1,7 @@
 if not lib then return end
 
----@overload fun(name: string): OxServerItem
 local Items = {}
-local ItemList = require 'modules.items.shared' --[[@as { [string]: OxServerItem }]]
+local ItemList = require 'modules.items.shared' --[[@as table<string, OxServerItem>]]
 local Utils = require 'modules.utils.server'
 
 TriggerEvent('ox_inventory:itemList', ItemList)
@@ -26,22 +25,25 @@ local trash = {
 ---@param name string?
 ---@return table?
 local function getItem(_, name)
-	if name then
-		name = name:lower()
+    if not name then return ItemList end
 
-		if name:sub(0, 7) == 'weapon_' then
-			name = name:upper()
-		end
+	if type(name) ~= 'string' then return end
 
-		return ItemList[name]
-	end
+    name = name:lower()
 
-	return ItemList
+    if name:sub(0, 7) == 'weapon_' then
+        name = name:upper()
+    end
+
+    return ItemList[name]
 end
 
 setmetatable(Items --[[@as table]], {
 	__call = getItem
 })
+
+---@cast Items +fun(itemName: string): OxServerItem
+---@cast Items +fun(): table<string, OxServerItem>
 
 -- Support both names
 exports('Items', function(item) return getItem(nil, item) end)
@@ -149,6 +151,9 @@ CreateThread(function()
 			for k, item in pairs(items) do
 				-- Explain why this wouldn't be table to me, because numerous people have been getting "attempted to index number" here
 				if type(item) == 'table' then
+					-- Some people don't assign the name property, but it seemingly always matches the index anyway.
+					if not item.name then item.name = k end
+
 					if not ItemList[item.name] and not checkIgnoredNames(item.name) then
 						item.close = item.shouldClose == nil and true or item.shouldClose
 						item.stack = not item.unique and true
@@ -214,12 +219,6 @@ CreateThread(function()
 		Wait(500)
 	end
 
-	local clearStashes = GetConvar('inventory:clearstashes', '6 MONTH')
-
-	if clearStashes ~= '' then
-		pcall(MySQL.query.await, ('DELETE FROM ox_inventory WHERE lastupdated < (NOW() - INTERVAL %s) OR data = "[]"'):format(clearStashes))
-	end
-
 	local count = 0
 
 	Wait(1000)
@@ -265,10 +264,18 @@ end
 
 local TriggerEventHooks = require 'modules.hooks.server'
 
+---@param inv inventory
+---@param item OxServerItem
+---@param metadata any
+---@param count number
+---@return table, number
+---Generates metadata for new items being created through AddItem, buyItem, etc.
 function Items.Metadata(inv, item, metadata, count)
 	if type(inv) ~= 'table' then inv = Inventory(inv) end
 	if not item.weapon then metadata = not metadata and {} or type(metadata) == 'string' and {type=metadata} or metadata end
 	if not count then count = 1 end
+
+	---@cast metadata table<string, any>
 
 	if item.weapon then
 		if type(metadata) ~= 'table' then metadata = {} end
@@ -344,6 +351,11 @@ function Items.Metadata(inv, item, metadata, count)
 	return metadata, count
 end
 
+---@param metadata table<string, any>
+---@param item OxServerItem
+---@param name string
+---@param ostime number
+---Validate (and in some cases convert) item metadata when an inventory is being loaded.
 function Items.CheckMetadata(metadata, item, name, ostime)
 	if metadata.bag then
 		metadata.container = metadata.bag
@@ -394,6 +406,41 @@ function Items.CheckMetadata(metadata, item, name, ostime)
 	end
 
 	return metadata
+end
+
+---Update item durability, and call `Inventory.RemoveItem` if it was removed from decay.
+---@param inv OxInventory
+---@param slot SlotWithItem
+---@param item OxServerItem
+---@param value? number
+---@param ostime? number
+---@return boolean? removed
+function Items.UpdateDurability(inv, slot, item, value, ostime)
+    local durability = slot.metadata.durability or value
+
+    if not durability then return end
+
+    if value then
+        durability = value
+    elseif ostime and durability > 100 and ostime >= durability then
+        durability = 0
+    end
+
+    if item.decay and durability == 0 then
+        return Inventory.RemoveItem(inv, slot.name, slot.count, nil, slot.slot)
+    end
+
+    if slot.metadata.durability == durability then return end
+
+    inv.changed = true
+    slot.metadata.durability = durability
+
+    inv:syncSlotsWithClients({
+        {
+            item = slot,
+            inventory = inv.id
+        }
+    }, true)
 end
 
 local function Item(name, cb)
